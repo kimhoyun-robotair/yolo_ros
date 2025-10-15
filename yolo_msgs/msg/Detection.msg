@@ -23,3 +23,6 @@ yolo_msgs/KeyPoint2DArray keypoints
 
 # keypoints for human pose estimation
 yolo_msgs/KeyPoint3DArray keypoints3d
+
+# data for depth estimation
+float64 depth 

@@ -13,7 +13,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 import cv2
 import numpy as np
 from typing import List, Tuple
@@ -23,12 +22,16 @@ from rclpy.qos import QoSProfile
 from rclpy.qos import QoSHistoryPolicy
 from rclpy.qos import QoSDurabilityPolicy
 from rclpy.qos import QoSReliabilityPolicy
+
+# lifecycle 도입
 from rclpy.lifecycle import LifecycleNode
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.lifecycle import LifecycleState
 
+# 토픽간 시간 오차 방지를 위해 메시지 필터 도입
 import message_filters
 from cv_bridge import CvBridge
+# 좌표 변환을 위해 tf2 라이브러리 사용
 from tf2_ros.buffer import Buffer
 from tf2_ros import TransformException
 from tf2_ros.transform_listener import TransformListener
@@ -40,7 +43,6 @@ from yolo_msgs.msg import DetectionArray
 from yolo_msgs.msg import KeyPoint3D
 from yolo_msgs.msg import KeyPoint3DArray
 from yolo_msgs.msg import BoundingBox3D
-from yolo_msgs.msg import DetectionInfo
 
 
 class Detect3DNode(LifecycleNode):
@@ -106,7 +108,6 @@ class Detect3DNode(LifecycleNode):
 
         # pubs
         self._pub = self.create_publisher(DetectionArray, "detections_3d", 10)
-        self._detection_info_pub = self.create_publisher(DetectionInfo, "detection_info", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -117,6 +118,7 @@ class Detect3DNode(LifecycleNode):
         self.get_logger().info(f"[{self.get_name()}] Activating...")
 
         # subs
+        # 시간 오차 최소화를 위해서 메시지 필터를 이용해서 subscirber들을 모두 통합
         self.depth_sub = message_filters.Subscriber(
             self, Image, "depth_image", qos_profile=self.depth_image_qos_profile
         )
@@ -126,7 +128,8 @@ class Detect3DNode(LifecycleNode):
         self.detections_sub = message_filters.Subscriber(
             self, DetectionArray, "detections"
         )
-
+        
+        # 싱크로나이즈 하고, 콜백 부여
         self._synchronizer = message_filters.ApproximateTimeSynchronizer(
             (self.depth_sub, self.depth_info_sub, self.detections_sub), 10, 0.5
         )
@@ -173,14 +176,16 @@ class Detect3DNode(LifecycleNode):
         depth_info_msg: CameraInfo,
         detections_msg: DetectionArray,
     ) -> None:
-
-        new_detections_msg = DetectionArray()
+        # 최종 yolo 탐지 결과를 publish 하는 콜백
+        new_detections_msg = DetectionArray() # 탐지 결과 배열 (여러 객체 탐지할 경우)
         new_detections_msg.header = detections_msg.header
         new_detections_msg.detections = self.process_detections(
             depth_msg, depth_info_msg, detections_msg
         )
         self._pub.publish(new_detections_msg)
 
+    # yolo 탐지를 수행하는 노드
+    # yolo 탐지 및 3차원 bbox 확장을 수행해서 최종 결과를 return 하는 함수
     def process_detections(
         self,
         depth_msg: Image,
@@ -192,7 +197,7 @@ class Detect3DNode(LifecycleNode):
         if not detections_msg.detections:
             return []
 
-        transform = self.get_transform(depth_info_msg.header.frame_id)
+        transform = self.get_transform(depth_info_msg.header.frame_id) # TF 변환을 통해 평행/회전 변환 정보 저장
 
         if transform is None:
             return []
@@ -200,16 +205,18 @@ class Detect3DNode(LifecycleNode):
         new_detections = []
         depth_image = self.cv_bridge.imgmsg_to_cv2(
             depth_msg, desired_encoding="passthrough"
-        )
+        ) # depth image를 ROS2에서 cv2로 변환
 
         for detection in detections_msg.detections:
-            bbox3d = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
+            # depth image와 yolo 탐지 결과르 통해 bbox를 3차원으로 확장
+            bbox3d, avg_depth = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
 
             if bbox3d is not None:
                 new_detections.append(detection)
 
                 bbox3d = Detect3DNode.transform_3d_box(bbox3d, transform[0], transform[1])
                 bbox3d.frame_id = self.target_frame
+                detection.depth = avg_depth
                 new_detections[-1].bbox3d = bbox3d
 
                 if detection.keypoints.data:
@@ -224,7 +231,7 @@ class Detect3DNode(LifecycleNode):
 
         return new_detections
 
-    def convert_bb_to_3d(
+    def convert_bb_to_3d( # 2차원 bbox를 3차원 bbox 확장
         self,
         depth_image: np.ndarray,
         depth_info: CameraInfo,
@@ -254,9 +261,28 @@ class Detect3DNode(LifecycleNode):
 
             roi = depth_image[v_min:v_max, u_min:u_max]
 
+            # 물체까지의 depth 추정을 위해서 별도의 ROI 설정
+            width_crop = int(size_x*0.3)
+            height_crop = int(size_y*0.3)
+
+            u_min_for_depth = max(center_x - size_x // 2 + width_crop, 0)
+            u_max_for_depth = min(center_x + size_x // 2 - width_crop, depth_image.shape[1] - 1)
+            v_min_for_depth = max(center_y - size_y // 2 + height_crop, 0)
+            v_max_for_depth = min(center_y + size_y // 2 - height_crop, depth_image.shape[0] - 1)
+
+            roi_for_depth = depth_image[v_min_for_depth:v_max_for_depth, u_min_for_depth:u_max_for_depth]
+
         roi = roi / self.depth_image_units_divisor  # convert to meters
+        roi_for_depth = roi_for_depth / self.depth_image_units_divisor # conver to meters for depth estimation
+        # 이중에서 유효한 depth값만 추정
+        valid_depth = roi_for_depth[np.isfinite(roi_for_depth) & (roi_for_depth>0)]
+        # outlier 제거
+        z_median = np.median(valid_depth)
+        z_std = np.std(valid_depth)
+        z_filterd = float(np.median(valid_depth[(valid_depth > z_median - 1.5*z_std) & (valid_depth < z_median + 1.5*z_std)]))
+
         if not np.any(roi):
-            return None
+            return None, None
 
         # find the z coordinate on the 3D BB
         if detection.mask.data:
@@ -271,22 +297,13 @@ class Detect3DNode(LifecycleNode):
         z_diff = np.abs(roi - bb_center_z_coord)
         mask_z = z_diff <= self.maximum_detection_threshold
         if not np.any(mask_z):
-            return None
-
+            return None, None
         roi = roi[mask_z]
         z_min, z_max = np.min(roi), np.max(roi)
         z = (z_max + z_min) / 2
 
-        info_msg = DetectionInfo()
-        info_msg.center_x = center_x
-        info_msg.center_y = center_y
-        # average_depth 계산 필요
-        info_msg.average_depth = z
-        info_msg.id = detection.class_id if hasattr(detection, 'class_id') else -1
-        self._detection_info_pub.publish(info_msg)
-
         if z == 0:
-            return None
+            return None, None
 
         # project from image to world space
         k = depth_info.k
@@ -305,9 +322,9 @@ class Detect3DNode(LifecycleNode):
         msg.size.y = h
         msg.size.z = float(z_max - z_min)
 
-        return msg
+        return msg, z_filterd
 
-    def convert_keypoints_to_3d(
+    def convert_keypoints_to_3d( # yolo의 2D keypoint (예: human pose)를 3차원으로 변환
         self,
         depth_image: np.ndarray,
         depth_info: CameraInfo,
@@ -345,7 +362,7 @@ class Detect3DNode(LifecycleNode):
 
         return msg_array
 
-    def get_transform(self, frame_id: str) -> Tuple[np.ndarray]:
+    def get_transform(self, frame_id: str) -> Tuple[np.ndarray]: # TF 변환 조회
         # transform position from image frame to target_frame
         rotation = None
         translation = None
@@ -379,7 +396,7 @@ class Detect3DNode(LifecycleNode):
             return None
 
     @staticmethod
-    def transform_3d_box(
+    def transform_3d_box( # 쿼터니언을 통해 3차원 bbox의 중심을 TF 좌표계로 변환
         bbox: BoundingBox3D,
         translation: np.ndarray,
         rotation: np.ndarray,
@@ -416,7 +433,7 @@ class Detect3DNode(LifecycleNode):
         return bbox
 
     @staticmethod
-    def transform_3d_keypoints(
+    def transform_3d_keypoints( # 3D Keypoint들도 TF 좌표계로 중심점을 변환
         keypoints: KeyPoint3DArray,
         translation: np.ndarray,
         rotation: np.ndarray,
@@ -437,7 +454,7 @@ class Detect3DNode(LifecycleNode):
         return keypoints
 
     @staticmethod
-    def qv_mult(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    def qv_mult(q: np.ndarray, v: np.ndarray) -> np.ndarray: # 쿼터니언과 벡터간 곱셉을 수행하는 함수 (cross product)
         q = np.array(q, dtype=np.float64)
         v = np.array(v, dtype=np.float64)
         qvec = q[1:]
