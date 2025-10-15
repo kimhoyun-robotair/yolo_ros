@@ -189,7 +189,7 @@ def generate_launch_description():
         depth_image_units_divisor = LaunchConfiguration("depth_image_units_divisor")
         depth_image_units_divisor_cmd = DeclareLaunchArgument(
             "depth_image_units_divisor",
-            default_value="1000",
+            default_value="1",
             description="Divisor used to convert the raw depth image values into metres",
         )
 

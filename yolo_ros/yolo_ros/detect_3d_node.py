@@ -40,6 +40,7 @@ from yolo_msgs.msg import DetectionArray
 from yolo_msgs.msg import KeyPoint3D
 from yolo_msgs.msg import KeyPoint3DArray
 from yolo_msgs.msg import BoundingBox3D
+from yolo_msgs.msg import DetectionInfo
 
 
 class Detect3DNode(LifecycleNode):
@@ -105,6 +106,7 @@ class Detect3DNode(LifecycleNode):
 
         # pubs
         self._pub = self.create_publisher(DetectionArray, "detections_3d", 10)
+        self._detection_info_pub = self.create_publisher(DetectionInfo, "detection_info", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -274,6 +276,14 @@ class Detect3DNode(LifecycleNode):
         roi = roi[mask_z]
         z_min, z_max = np.min(roi), np.max(roi)
         z = (z_max + z_min) / 2
+
+        info_msg = DetectionInfo()
+        info_msg.center_x = center_x
+        info_msg.center_y = center_y
+        # average_depth 계산 필요
+        info_msg.average_depth = z
+        info_msg.id = detection.class_id if hasattr(detection, 'class_id') else -1
+        self._detection_info_pub.publish(info_msg)
 
         if z == 0:
             return None
